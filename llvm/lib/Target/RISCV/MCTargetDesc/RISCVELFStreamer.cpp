@@ -209,6 +209,10 @@ class RISCVELFStreamer : public MCELFStreamer {
 
   static bool requiresFixups(MCContext &C, const MCExpr *Value,
                              const MCExpr *&LHS, const MCExpr *&RHS) {
+    auto IsEHOrAppleSection = [](const MCSection &S) -> bool {
+    return S.getName() == ".eh_frame" || S.getName() == ".apple_names" ||
+           S.getName() == ".apple_types";
+    };
     const auto *MBE = dyn_cast<MCBinaryExpr>(Value);
     if (MBE == nullptr)
       return false;
@@ -227,21 +231,23 @@ class RISCVELFStreamer : public MCELFStreamer {
                              MCConstantExpr::create(E.getConstant(), C), C);
     RHS = E.getSymB();
 
-    // If either symbol is in a text section, we need to delay the relocation
-    // evaluation as relaxation may alter the size of the symbol.
-    //
-    // Unfortunately, we cannot identify if the symbol was built with relaxation
-    // as we do not track the state per symbol or section.  However, BFD will
-    // always emit the relocation and so we follow suit which avoids the need to
-    // track that information.
-    if (A.isInSection() && A.getSection().getKind().isText())
-      return true;
-    if (B.isInSection() && B.getSection().getKind().isText())
-      return true;
+    // Avoid R_RISCV_{ADD,SUB}* if Kind is not VK_None, e.g. A@plt - B + C.
+    if (E.getSymA()->getKind() != MCSymbolRefExpr::VK_None)
+      return false;
 
-    // Support cross-section symbolic differences ...
-    return A.isInSection() && B.isInSection() &&
-           A.getSection().getName() != B.getSection().getName();
+    // At this point we should emit ADD/SUB pairs for most A - B + C expressions.
+    // Unfortunately, MCDwarf has some instances like FrameEmitterImpl::EmitCIE
+    // that need to avoid ADD/SUB while it is unknown that A is in a section. For
+    // .apple_names/.apple_types. They are fixed-size and do not need fixups.
+    // llvm-dwarfdump --apple-names does not process R_RISCV_{ADD,SUB}32 in them.
+    //
+    // For now, hard code these sections that avoid ADD/SUB.
+    if (A.isInSection())
+      return !IsEHOrAppleSection(A.getSection());
+    if (B.isInSection())
+      return !IsEHOrAppleSection(B.getSection());
+
+    return false;
   }
 
   void reset() override {
