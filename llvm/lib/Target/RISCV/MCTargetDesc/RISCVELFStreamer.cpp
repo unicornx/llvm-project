@@ -207,14 +207,6 @@ class RISCVELFStreamer : public MCELFStreamer {
 
   static bool requiresFixups(MCContext &C, const MCExpr *Value,
                              const MCExpr *&LHS, const MCExpr *&RHS) {
-    auto IsMetadataOrEHFrameSection = [](const MCSection &S) -> bool {
-      // Additionally check .apple_names/.apple_types. They are fixed-size and
-      // do not need fixups. llvm-dwarfdump --apple-names does not process
-      // R_RISCV_{ADD,SUB}32 in them.
-      return S.getKind().isMetadata() || S.getName() == ".eh_frame" ||
-             S.getName() == ".apple_names" || S.getName() == ".apple_types";
-    };
-
     const auto *MBE = dyn_cast<MCBinaryExpr>(Value);
     if (MBE == nullptr)
       return false;
@@ -228,20 +220,39 @@ class RISCVELFStreamer : public MCELFStreamer {
     const auto &A = E.getSymA()->getSymbol();
     const auto &B = E.getSymB()->getSymbol();
 
-    LHS =
-        MCBinaryExpr::create(MCBinaryExpr::Add, MCSymbolRefExpr::create(&A, C),
+    LHS = MCBinaryExpr::create(MCBinaryExpr::Add, MCSymbolRefExpr::create(&A, C),
                              MCConstantExpr::create(E.getConstant(), C), C);
     RHS = E.getSymB();
 
-    // TODO: when available, R_RISCV_n_PCREL should be preferred.
+    // Avoid ADD/SUB if Kind is not VK_None, e.g. A@plt - B + C.
+    if (E.getSymA()->getKind() != MCSymbolRefExpr::VK_None)
+      return false;
 
-    // Avoid pairwise relocations for symbolic difference in debug and .eh_frame
-    if (A.isInSection())
-      return !IsMetadataOrEHFrameSection(A.getSection());
-    if (B.isInSection())
-      return !IsMetadataOrEHFrameSection(B.getSection());
-    // as well as for absolute symbols.
-    return !A.getName().empty() || !B.getName().empty();
+    // If either symbol is in a text section, we need to delay the relocation
+    // evaluation as relaxation may alter the size of the symbol.
+    //
+    // Unfortunately, we cannot identify if the symbol was built with relaxation
+    // as we do not track the state per symbol or section.  However, BFD will
+    // always emit the relocation and so we follow suit which avoids the need to
+    // track that information.
+    if (A.isInSection() && A.getSection().getKind().isText())
+      return true;
+    if (B.isInSection() && B.getSection().getKind().isText())
+      return true;
+
+    // If A is undefined and B is defined, we should emit ADD/SUB for A-B.
+    // Unfortunately, A may be defined later, but this requiresFixups call has to
+    // eagerly make a decision. For now, emit ADD/SUB unless A is .L*. This
+    // heuristic handles many temporary label differences for .debug_* and
+    // .apple_types sections.
+    //
+    // TODO Implement delayed relocation decision.
+    if (!A.isInSection() && !A.isTemporary() && B.isInSection())
+      return true;
+
+    // Support cross-section symbolic differences ...
+    return A.isInSection() && B.isInSection() &&
+           A.getSection().getName() != B.getSection().getName();
   }
 
   void reset() override {
